@@ -5,7 +5,7 @@ fragments, MP3 with real album art, MP4 video, playlist-aware output layout.
 
 Single file: [`musicdl`](./musicdl) — symlink it onto your `PATH` and develop here.
 
-![musicdl --video demo](./assets/screenshot-video.png)
+![musicdl --video demo](./assets/demo.gif)
 
 ## Features
 
