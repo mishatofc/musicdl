@@ -1,0 +1,688 @@
+#!/usr/bin/env fish
+
+# ╭──────────────────────────────────────────────────────────────╮
+# │                         musicdl                              │
+# │             YouTube Music / Video Downloader                 │
+# ╰──────────────────────────────────────────────────────────────╯
+
+set -g VERSION "1.6.0"
+set -g START_TIME (date +%s)
+
+set -g TTY 0
+if test -t 1
+    set -g TTY 1
+end
+
+set -g COLS (tput cols 2>/dev/null; or echo 80)
+
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
+
+function _c
+    # set_color only when writing to a terminal
+    if test $TTY -eq 1
+        set_color $argv
+    end
+end
+
+function clr
+    # clear the current line (in-place updates)
+    if test $TTY -eq 1
+        printf '\r\e[K'
+    end
+end
+
+function msg_err
+    set_color red 2>/dev/null
+    echo "  ✗ $argv"
+    set_color normal 2>/dev/null
+end >&2
+
+function die
+    echo ""
+    msg_err $argv
+    echo "    Try: musicdl --help" >&2
+    echo ""
+    exit 1
+end
+
+function row
+    _c brblack
+    printf "  %-11s│ " $argv[1]
+    _c normal
+    echo $argv[2]
+end
+
+function fmt_time -a s
+    set -l m (math "floor($s / 60)")
+    set -l r (math "$s % 60")
+    if test $m -gt 0
+        echo "$m"m "$r"s
+    else
+        echo "$s"s
+    end
+end
+
+# bar PERCENT WIDTH COLOR  ->  ████████░░░░░░
+function bar -a pct width color
+    set -l filled (math "floor(min($pct, 100) * $width / 100)")
+    set -l empty (math "$width - $filled")
+    set -l a ""
+    set -l b ""
+    test $filled -gt 0; and set a (string repeat -n $filled '█')
+    test $empty -gt 0; and set b (string repeat -n $empty '░')
+    _c $color
+    echo -n $a
+    _c brblack
+    echo -n $b
+    _c normal
+end
+
+# red -> yellow -> green as the bar fills
+function pct_color -a p
+    set -l n (math "floor($p)")
+    if test $n -lt 34
+        echo red
+    else if test $n -lt 67
+        echo yellow
+    else
+        echo green
+    end
+end
+
+# friendly names for yt-dlp post-processing stages
+function stage_label -a pp
+    switch $pp
+        case '*ExtractAudio*'
+            echo "Converting to MP3"
+        case '*Merger*'
+            echo "Merging video + audio"
+        case '*VideoConvertor*'
+            echo "Converting video"
+        case '*ThumbnailsConvertor*'
+            echo "Preparing cover"
+        case '*EmbedThumbnail*'
+            echo "Embedding cover"
+        case '*Metadata*'
+            echo "Writing tags"
+        case '*'
+            echo ""
+    end
+end
+
+# Reads yt-dlp's machine-readable progress lines and draws the pretty UI
+function render_output
+    set -l cur ""
+    set -l stream 0
+    set -l last 0
+    set -l waiting 1
+    set -l bar_w 28
+
+    while read -l line
+        if test $waiting -eq 1
+            clr
+            set waiting 0
+        end
+
+        # ── download progress ──────────────────────────────
+        if string match -q 'D|*' -- "$line"
+            set -l f (string split -m 7 '|' -- "$line")
+            set -l st "$f[2]"
+            set -l p (string replace -a -r '[^0-9.]' '' -- "$f[3]")
+            set -l spd (string trim -- "$f[4]")
+            set -l eta (string trim -- "$f[5]")
+            set -l idx "$f[6]"
+            set -l cnt "$f[7]"
+            set -l title "$f[8]"
+
+            test -z "$p"; and set p 0
+            test "$st" = finished; and set p 100
+
+            if test "$title" != "$cur"
+                set cur "$title"
+                set stream 1
+                set last 0
+                set -l tag ""
+                test -n "$idx"; and set tag "[$idx/$cnt] "
+                echo ""
+                echo -n "  "
+                _c brmagenta
+                echo -n "$tag"
+                _c --bold white
+                echo (string shorten -m (math "$COLS - 12") -- "$title")
+                _c normal
+            else if test (math "floor($last - $p)") -gt 30
+                set stream (math "$stream + 1")
+            end
+            set last $p
+
+            set -l label Downloading
+            if test "$DL_MODE" = video
+                switch $stream
+                    case 1
+                        set label Video
+                    case 2
+                        set label Audio
+                    case '*'
+                        set label "Stream $stream"
+                end
+            end
+
+            if test $TTY -eq 1
+                printf '\r\e[K  '
+                _c cyan
+                printf '⬇ %-11s ' $label
+                _c normal
+                bar $p $bar_w (pct_color $p)
+                _c --bold white
+                printf ' %5.1f%%' $p
+                _c brblack
+                if test "$st" = finished
+                    printf '  done'
+                else
+                    printf '  %s · ETA %s' $spd $eta
+                end
+                _c normal
+                test "$st" = finished; and echo ""
+            else if test "$st" = finished
+                echo "  ⬇ $label 100%"
+            end
+
+        # ── post-processing stages ─────────────────────────
+        else if string match -q 'P|*' -- "$line"
+            set -l f (string split -m 3 '|' -- "$line")
+            set -l st "$f[2]"
+            set -l pp "$f[3]"
+            set -l title "$f[4]"
+
+            if test "$title" != "$cur"
+                set cur "$title"
+                set stream 1
+                set last 0
+                echo ""
+                echo -n "  "
+                _c --bold white
+                echo (string shorten -m (math "$COLS - 6") -- "$title")
+                _c normal
+            end
+
+            if test "$pp" = MoveFiles; and test "$st" = finished
+                clr
+                echo -n "  "
+                _c green
+                echo "✓ Saved"
+                _c normal
+            else if test "$st" = started
+                set -l lbl (stage_label $pp)
+                if test -n "$lbl"
+                    if test $TTY -eq 1
+                        printf '\r\e[K  '
+                        _c yellow
+                        printf '⚙ %s…' $lbl
+                        _c normal
+                    else
+                        echo "  ⚙ $lbl…"
+                    end
+                end
+            end
+
+        # ── errors ─────────────────────────────────────────
+        else if string match -q 'ERROR:*' -- "$line"
+            clr
+            echo "$line" >> $ERRFILE
+            echo -n "  "
+            _c red
+            echo "✗ "(string replace -r '^ERROR:\s*' '' -- "$line" | string shorten -m (math "$COLS - 6"))
+            _c normal
+        end
+    end
+
+    if test $waiting -eq 1
+        clr
+    end
+end
+
+function show_help
+    echo "
+  musicdl $VERSION
+  YouTube Music / Video Downloader
+
+USAGE
+  musicdl [OPTIONS] URL [URL...]
+
+  Each URL can be a single song/video or a whole playlist.
+
+MODES
+  --music                     Download audio as MP3 (default)
+  --video                     Download video as MP4
+
+AUDIO QUALITY
+  -q, --quality PRESET        best (320) | good (256) | normal (192) | small (128)
+  -a, --audio-quality RATE    Exact MP3 bitrate: 128, 192, 256, 320
+                              (overrides --quality)
+
+VIDEO
+  -r, --resolution HEIGHT     240, 360, 480, 720, 1080 (default), 1440, 2160
+
+GENERAL
+  -o, --output DIR            Base folder (default: ~/Music or ~/Videos)
+  -j, --jobs N                Concurrent fragments (default: 4)
+      --no-playlist           If a URL is a video inside a playlist,
+                              download only that video
+      --no-art                Don't look up real album art (keep YouTube thumbnail)
+  -h, --help                  Show this help
+      --version               Show version
+
+EXAMPLES
+  musicdl 'https://youtube.com/watch?v=...'
+  musicdl 'https://youtube.com/playlist?list=...'
+  musicdl -q good 'URL'
+  musicdl -a 192 'URL1' 'URL2'
+  musicdl --video -r 360 'URL'
+  musicdl --video -r 2160 -o ~/Movies 'URL'
+  musicdl --no-playlist 'https://youtube.com/watch?v=...&list=...'
+
+NOTE
+  YouTube's own audio is roughly 128-160 kbps, so 320 kbps MP3 gives
+  larger files but not better sound. 192 is plenty for most uses.
+"
+end
+
+# ── Cover-art lookup helpers (free APIs, no keys needed) ──────
+
+function clean_artist
+    # "Artist - Topic" / "ArtistVEVO" / "A, B"  ->  "Artist"
+    string replace -r -i ' - topic$' '' -- "$argv[1]" \
+        | string replace -r -i 'vevo$' '' \
+        | string split -f1 ',' \
+        | string trim
+end
+
+function clean_title
+    # Drop "(Official Video)", "[Lyrics]", "(feat. X)", trailing "ft. X", etc.
+    string replace -r -i -a '\s*[\(\[][^\)\]]*(official|lyric|audio|video|visualizer|remaster|feat|ft\.)[^\)\]]*[\)\]]' '' -- "$argv[1]" \
+        | string replace -r -i '\s+(ft\.?|feat\.?|featuring)\s.*$' '' \
+        | string trim
+end
+
+function art_itunes -a artist title
+    set -l q (string escape --style=url -- "$artist $title")
+    curl -fsSL --max-time 15 "https://itunes.apple.com/search?term=$q&media=music&entity=song&limit=10" 2>/dev/null \
+        | jq -r --arg t "$title" '[.results[]? | select((.trackName|ascii_downcase) as $n | ($t|ascii_downcase) as $q | ($n|contains($q)) or ($q|contains($n)))][0].artworkUrl100 // empty' 2>/dev/null \
+        | string replace -r '/[0-9]+x[0-9]+bb' '/1200x1200bb' \
+        | head -n1
+end
+
+function art_deezer -a artist title
+    set -l q (string escape --style=url -- "$artist $title")
+    curl -fsSL --max-time 15 "https://api.deezer.com/search?q=$q&limit=10" 2>/dev/null \
+        | jq -r --arg t "$title" '[.data[]? | select((.title|ascii_downcase) as $n | ($t|ascii_downcase) as $q | ($n|contains($q)) or ($q|contains($n)))][0].album.cover_xl // empty' 2>/dev/null \
+        | head -n1
+end
+
+# ──────────────────────────────────────────────────────────────
+# Parse arguments
+# ──────────────────────────────────────────────────────────────
+
+argparse -n musicdl \
+    -x music,video \
+    'h/help' 'version' 'music' 'video' \
+    'q/quality=' 'a/audio-quality=' 'r/resolution=' \
+    'j/jobs=' 'o/output=' 'no-playlist' 'no-art' \
+    -- $argv
+or exit 1
+
+if set -q _flag_help
+    show_help
+    exit 0
+end
+
+if set -q _flag_version
+    echo "musicdl $VERSION"
+    exit 0
+end
+
+# Defaults
+set mode music
+set bitrate 320
+set resolution 1080
+set jobs 4
+
+if set -q _flag_video
+    set mode video
+end
+set -g DL_MODE $mode
+
+# Quality preset
+if set -q _flag_quality
+    switch $_flag_quality
+        case best
+            set bitrate 320
+        case good
+            set bitrate 256
+        case normal
+            set bitrate 192
+        case small
+            set bitrate 128
+        case '*'
+            die "Invalid quality '$_flag_quality'. Use: best, good, normal, small."
+    end
+end
+
+# Exact bitrate (wins over preset)
+if set -q _flag_audio_quality
+    if not contains -- $_flag_audio_quality 128 192 256 320
+        die "Unsupported bitrate '$_flag_audio_quality'. Use: 128, 192, 256, 320."
+    end
+    set bitrate $_flag_audio_quality
+end
+
+# Resolution
+if set -q _flag_resolution
+    if not contains -- $_flag_resolution 240 360 480 720 1080 1440 2160
+        die "Unsupported resolution '$_flag_resolution'. Use: 240 360 480 720 1080 1440 2160."
+    end
+    set resolution $_flag_resolution
+end
+
+# Jobs
+if set -q _flag_jobs
+    if not string match -rq '^[1-9][0-9]*$' -- $_flag_jobs
+        die "--jobs must be a positive whole number."
+    end
+    set jobs $_flag_jobs
+end
+
+# URLs (everything argparse left over)
+set urls $argv
+
+if test (count $urls) -eq 0
+    show_help
+    die "At least one URL is required."
+end
+
+for u in $urls
+    if not string match -rq '^https?://' -- $u
+        die "'$u' doesn't look like a URL (it must start with http:// or https://)."
+    end
+end
+
+# Output directory
+if test $mode = music
+    set outdir "$HOME/Music"
+else
+    set outdir "$HOME/Videos"
+end
+
+if set -q _flag_output
+    # expand a leading ~ (the shell won't do it for --output=~/x)
+    set outdir (string replace -r '^~' -- $HOME $_flag_output)
+end
+
+# ──────────────────────────────────────────────────────────────
+# Dependencies
+# ──────────────────────────────────────────────────────────────
+
+set deps yt-dlp ffmpeg
+if test $mode = music; and not set -q _flag_no_art
+    set -a deps curl jq
+end
+
+for dep in $deps
+    if not command -q $dep
+        die "$dep is not installed. Install it with: sudo pacman -S $dep"
+    end
+end
+
+# ──────────────────────────────────────────────────────────────
+# Header
+# ──────────────────────────────────────────────────────────────
+
+echo ""
+_c cyan
+echo "  ╭──────────────────────────────────────────────╮"
+printf "  │ %-44s │\n" "musicdl $VERSION"
+printf "  │ %-44s │\n" "YouTube Music / Video Downloader"
+echo "  ╰──────────────────────────────────────────────╯"
+_c normal
+echo ""
+
+if test $mode = music
+    row Mode "Music (MP3)"
+    row Quality "$bitrate kbps"
+    if set -q _flag_no_art
+        row "Cover art" "YouTube thumbnail"
+    else
+        row "Cover art" "Real album art (iTunes / Deezer)"
+    end
+else
+    row Mode "Video (MP4)"
+    row Resolution "up to "$resolution"p"
+end
+row Location $outdir
+row Jobs $jobs
+row URLs (count $urls)
+
+mkdir -p $outdir
+or die "Could not create '$outdir'."
+
+# temp files: list of finished files + error log
+set -g TMPD (mktemp -d)
+set -g ERRFILE $TMPD/errors.txt
+set listfile $TMPD/files.txt
+touch $ERRFILE $listfile
+
+function _cleanup --on-event fish_exit
+    rm -rf $TMPD
+end
+
+# ──────────────────────────────────────────────────────────────
+# Download
+# ──────────────────────────────────────────────────────────────
+
+# yt-dlp runs quietly; we print machine-readable progress lines
+# (D|... for downloads, P|... for conversion stages) and draw them ourselves.
+set common \
+    --ignore-errors \
+    --no-overwrites \
+    --continue \
+    --concurrent-fragments $jobs \
+    --embed-metadata \
+    --windows-filenames \
+    --quiet --no-warnings --color never \
+    --progress --newline \
+    --progress-template "download:D|%(progress.status)s|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.playlist_index|)s|%(info.n_entries|)s|%(info.title)s" \
+    --progress-template "postprocess:P|%(progress.status)s|%(progress.postprocessor)s|%(info.title)s" \
+    --print-to-file "after_move:filepath" $listfile
+
+if set -q _flag_no_playlist
+    set -a common --no-playlist
+end
+
+echo ""
+if test $TTY -eq 1
+    _c cyan
+    printf '  ◌ Fetching info…'
+    _c normal
+end
+
+if test $mode = music
+    # Layout: Artist/Album-or-Playlist/Title.mp3 (falls back to Unknown Artist/Singles)
+    # Cover art is center-cropped to a square, which is what players expect.
+    yt-dlp $common \
+        --extract-audio \
+        --audio-format mp3 \
+        --audio-quality "$bitrate"K \
+        --embed-thumbnail \
+        --convert-thumbnails jpg \
+        --ppa "ThumbnailsConvertor+ffmpeg_o:-q:v 2 -vf crop=ih:ih" \
+        --output "$outdir/%(artist,uploader|Unknown Artist)s/%(album,playlist_title|Singles)s/%(title)s.%(ext)s" \
+        $urls 2>&1 | render_output
+    set rc $pipestatus[1]
+else
+    # Layout: [Playlist/]Title.mp4 (no "NA" folder for single videos)
+    yt-dlp $common \
+        --format "bv*[height<=$resolution]+ba/b[height<=$resolution]/b" \
+        --merge-output-format mp4 \
+        --output "$outdir/%(playlist_title&{}/|)s%(title)s.%(ext)s" \
+        $urls 2>&1 | render_output
+    set rc $pipestatus[1]
+end
+
+# ──────────────────────────────────────────────────────────────
+# Real cover art (replaces the YouTube thumbnail when a match is found)
+# ──────────────────────────────────────────────────────────────
+
+if test $mode = music; and not set -q _flag_no_art; and test -s $listfile
+    set lines (cat $listfile)
+    set files (string match -r '\.mp3$' -- $lines)
+    set total (count $files)
+    set n 0
+    set found 0
+    set missed 0
+
+    if test $total -gt 0
+        echo ""
+        echo -n "  "
+        _c --bold cyan
+        echo "◆ Fetching real cover art"
+        _c normal
+        echo ""
+    end
+
+    for f in $files
+        test -f "$f"; or continue
+
+        set label (path basename $f)
+
+        # in-place bar showing which song we're on
+        if test $TTY -eq 1
+            printf '\r\e[K  '
+            bar (math "$n * 100 / $total") 28 cyan
+            _c --bold white
+            printf ' %d/%d ' $n $total
+            _c brblack
+            printf '%s' (string shorten -m 36 -- $label)
+            _c normal
+        end
+
+        set tag_artist (ffprobe -v error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 $f 2>/dev/null | head -n1)
+        set tag_title (ffprobe -v error -show_entries format_tags=title -of default=noprint_wrappers=1:nokey=1 $f 2>/dev/null | head -n1)
+
+        set url ""
+        set src ""
+
+        if test -n "$tag_artist"; and test -n "$tag_title"
+            set artist (clean_artist "$tag_artist")
+            set title (clean_title "$tag_title")
+
+            set url (art_itunes "$artist" "$title")
+            if test -n "$url"
+                set src iTunes
+            else
+                set url (art_deezer "$artist" "$title")
+                test -n "$url"; and set src Deezer
+            end
+        end
+
+        set n (math "$n + 1")
+        set ok 0
+
+        if test -n "$url"
+            set img $TMPD/cover.jpg
+            set out $TMPD/out.mp3
+            rm -f $img $out
+
+            if curl -fsSL --max-time 30 -o $img "$url"
+                and ffmpeg -y -loglevel error -i $f -i $img \
+                    -map 0:a -map 1:v -c copy -id3v2_version 3 \
+                    -metadata:s:v title="Album cover" \
+                    -metadata:s:v comment="Cover (front)" $out
+                and mv -f $out $f
+                set ok 1
+            end
+        end
+
+        clr
+        echo -n "  "
+        if test $ok -eq 1
+            _c green
+            echo -n "✓ "
+            _c normal
+            echo -n (string shorten -m 50 -- $label)
+            _c brblack
+            echo "  ($src)"
+            _c normal
+            set found (math "$found + 1")
+        else
+            _c yellow
+            echo -n "– "
+            _c normal
+            echo -n (string shorten -m 50 -- $label)
+            _c brblack
+            echo "  (no match, kept thumbnail)"
+            _c normal
+            set missed (math "$missed + 1")
+        end
+    end
+
+    if test $total -gt 0
+        echo ""
+        echo -n "  "
+        bar 100 28 green
+        _c --bold white
+        echo " $found replaced · $missed kept"
+        _c normal
+    end
+end
+
+# ──────────────────────────────────────────────────────────────
+# Summary
+# ──────────────────────────────────────────────────────────────
+
+set n_ok (count (cat $listfile))
+set n_fail (count (cat $ERRFILE))
+set elapsed (math (date +%s) - $START_TIME)
+
+echo ""
+_c brblack
+echo "  ────────────────────────────────────────────────────────────"
+_c normal
+echo ""
+
+echo -n "  "
+_c green
+echo -n "✓ $n_ok saved"
+_c normal
+
+if test $n_fail -gt 0
+    echo -n "    "
+    _c red
+    echo -n "✗ $n_fail failed"
+    _c normal
+end
+
+echo -n "    "
+_c brblack
+echo -n "⏱ "(fmt_time $elapsed)"    📁 $outdir"
+_c normal
+echo ""
+echo ""
+
+switch $rc
+    case 0
+        _c green
+        echo "  All done."
+    case 130
+        _c yellow
+        echo "  Interrupted. Re-run the same command to resume."
+    case '*'
+        _c yellow
+        echo "  Finished with errors (private, region-locked or removed items)."
+        echo "  Re-run the same command to retry them."
+end
+
+_c normal
+echo ""
+exit $rc
